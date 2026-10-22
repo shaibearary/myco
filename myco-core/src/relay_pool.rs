@@ -428,7 +428,11 @@ impl Stream for Watched {
         loop {
             match std::pin::Pin::new(&mut this.ws).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Some(Err(ConnectionError::Read(
+                        "relay WebSocket stream ended".into(),
+                    ))))
+                }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(ConnectionError::Read(e.to_string()))))
                 }
@@ -441,7 +445,19 @@ impl Stream for Watched {
                         Message::Binary(bytes) => {
                             return Poll::Ready(Some(Ok(SocketFrame::Binary(bytes))))
                         }
-                        Message::Close(_) => return Poll::Ready(None),
+                        Message::Close(frame) => {
+                            // The pool treats EOF as normal completion without
+                            // notifying pending requests. Surface a disconnect
+                            // so every waiter ends immediately, retaining why.
+                            let reason = match frame {
+                                Some(frame) => format!(
+                                    "relay closed WebSocket ({}): {}",
+                                    frame.code, frame.reason
+                                ),
+                                None => "relay closed WebSocket without a reason".into(),
+                            };
+                            return Poll::Ready(Some(Err(ConnectionError::Read(reason))));
+                        }
                         // Ping, pong, raw frames: liveness noted above.
                         _ => continue,
                     }
@@ -574,6 +590,52 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// A normal WebSocket close must fail all pending reads, not leave them
+    /// waiting for their outer deadlines. Keep the server alive for the close
+    /// handshake so an abrupt TCP drop cannot accidentally make this test pass.
+    #[tokio::test]
+    async fn close_frame_fails_pending_requests() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut requests = 0;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame[0] == "REQ" {
+                    requests += 1;
+                    if requests == 2 {
+                        break;
+                    }
+                }
+            }
+            ws.send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "test relay restart".into(),
+            })))
+            .await
+            .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                request(&url, vec![serde_json::json!({"kinds": [30063]})], |_| {}),
+                request(&url, vec![serde_json::json!({"kinds": [1]})], |_| {})
+            )
+        })
+        .await
+        .expect("WebSocket close left pending requests waiting");
+        for response in [result.0, result.1] {
+            let error = response.unwrap_err().to_string();
+            assert!(error.contains("test relay restart"), "{error}");
+            assert!(error.contains("1001"), "{error}");
+        }
+        server.abort();
     }
 
     /// A read over the pool reaches a relay and hands back its events.
